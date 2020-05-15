@@ -25,6 +25,7 @@
 #ifndef LLVM_ADT_STATISTIC_H
 #define LLVM_ADT_STATISTIC_H
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Compiler.h"
 #include <atomic>
@@ -128,6 +129,17 @@ protected:
   }
 
   void RegisterStatistic();
+};
+
+struct CallSiteParamsStats : public TrackingStatistic {
+  static DenseMap<unsigned, std::string> OpcodeToInstrMap;
+  static DenseMap<unsigned, std::pair<unsigned, unsigned>> OpcodeMissFreq;
+  // Number of misses.
+  static unsigned TotalMissCnt;
+  // Number of successes.
+  static unsigned TotalHitCnt;
+  // Number of DW_OP_entry_value used as parameter value.
+  static unsigned TotalEntryValsAsCallSiteParamValsCnt;
 };
 
 class NoopStatistic : public StatisticBase {

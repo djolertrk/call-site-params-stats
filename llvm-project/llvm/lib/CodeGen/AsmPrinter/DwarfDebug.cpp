@@ -23,6 +23,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -80,6 +81,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+// FIXME: This violates the LLVM Coding Standard.
+#include <fstream>
 
 using namespace llvm;
 
@@ -639,6 +643,14 @@ static void addToFwdRegWorklist(FwdRegWorklist &Worklist, unsigned Reg,
   }
 }
 
+// Used to calculate the describing of DW_AT_call_site_value efficiency.
+DenseMap<unsigned, std::string> CallSiteParamsStats::OpcodeToInstrMap;
+DenseMap<unsigned, std::pair<unsigned, unsigned>>
+    CallSiteParamsStats::OpcodeMissFreq;
+unsigned CallSiteParamsStats::TotalMissCnt = 0;
+unsigned CallSiteParamsStats::TotalHitCnt = 0;
+unsigned CallSiteParamsStats::TotalEntryValsAsCallSiteParamValsCnt = 0;
+
 /// Try to interpret values loaded into registers that forward parameters
 /// for \p CallMI. Store parameters with interpreted value into \p Params.
 static void collectCallSiteParameters(const MachineInstr *CallMI,
@@ -742,8 +754,10 @@ static void collectCallSiteParameters(const MachineInstr *CallMI,
     if (FwdRegDefs.empty())
       continue;
 
+    bool IsDescribed = false;
     for (auto ParamFwdReg : FwdRegDefs) {
       if (auto ParamValue = TII->describeLoadedValue(*I, ParamFwdReg)) {
+        IsDescribed = true;
         if (ParamValue->first.isImm()) {
           int64_t Val = ParamValue->first.getImm();
           finishCallSiteParams(Val, ParamValue->second,
@@ -769,6 +783,37 @@ static void collectCallSiteParameters(const MachineInstr *CallMI,
           }
         }
       }
+
+      // Measure the describeLoadedValue() success rate.
+      unsigned Opc = I->getOpcode();
+
+      // TODO: Factor out this into a static function.
+      // Total success rate.
+      if (IsDescribed)
+        CallSiteParamsStats::TotalHitCnt++;
+      else
+        CallSiteParamsStats::TotalMissCnt++;
+
+      // Success rate by instruction used to load parameter value.
+      if (CallSiteParamsStats::OpcodeMissFreq.lookup(Opc).first == 0 &&
+          CallSiteParamsStats::OpcodeMissFreq.lookup(Opc).second == 0) {
+        if (IsDescribed) {
+          CallSiteParamsStats::OpcodeMissFreq.insert(
+              std::make_pair(Opc, std::make_pair(0, 1)));
+          CallSiteParamsStats::OpcodeToInstrMap.insert(
+              std::make_pair(Opc, static_cast<std::string>(TII->getName(Opc))));
+        } else {
+          CallSiteParamsStats::OpcodeMissFreq.insert(
+              std::make_pair(Opc, std::make_pair(1, 0)));
+          CallSiteParamsStats::OpcodeToInstrMap.insert(
+              std::make_pair(Opc, static_cast<std::string>(TII->getName(Opc))));
+        }
+      } else {
+        if (IsDescribed)
+          CallSiteParamsStats::OpcodeMissFreq[Opc].second += 1;
+        else
+          CallSiteParamsStats::OpcodeMissFreq[Opc].first += 1;
+      }
     }
 
     // Remove all registers that this instruction defines from the worklist.
@@ -789,6 +834,7 @@ static void collectCallSiteParameters(const MachineInstr *CallMI,
     DIExpression *EntryExpr = DIExpression::get(
         MF->getFunction().getContext(), {dwarf::DW_OP_LLVM_entry_value, 1});
     for (auto RegEntry : ForwardedRegWorklist) {
+      CallSiteParamsStats::TotalEntryValsAsCallSiteParamValsCnt++;
       MachineLocation MLoc(RegEntry.first);
       finishCallSiteParams(MLoc, EntryExpr, RegEntry.second, Params);
     }
@@ -1321,6 +1367,50 @@ void DwarfDebug::finalizeModuleInfo() {
   InfoHolder.computeSizeAndOffsets();
   if (useSplitDwarf())
     SkeletonHolder.computeSizeAndOffsets();
+
+  // Output The Call site params description statistics.
+  double TotalMisses = CallSiteParamsStats::TotalMissCnt;
+  double Total =
+      CallSiteParamsStats::TotalMissCnt + CallSiteParamsStats::TotalHitCnt;
+  double EntryValPercentage =
+      CallSiteParamsStats::TotalEntryValsAsCallSiteParamValsCnt / Total * 100;
+  if (Total > 0) {
+    double TotalMissPercentage = TotalMisses / Total * 100;
+    dbgs() << "\n\nDW_OP_entry_values as call site param values: "
+           << format("%4.5f", EntryValPercentage) << " % \n";
+    dbgs() << "============================================================"
+           << "===================\n";
+    dbgs() << "Total miss percent: " << format("%4.5f", TotalMissPercentage)
+           << " % \n";
+    dbgs() << "OPCODE\t\tMISS#\t\tHIT#\t\tINSTRUCTION\n";
+    dbgs() << "----------------------------------------------------------------"
+           << "-----------\n";
+
+    // Write the stats into a file.
+    std::ofstream DescCSParamLogFile;
+    DescCSParamLogFile.open("../descrInstrLog.txt", std::ios_base::app);
+    // Write the opcode - instruction_name maping to a file.
+    std::ofstream InstrNamesFile;
+    InstrNamesFile.open("../instrNames.txt", std::ios_base::app);
+
+    for (auto it = CallSiteParamsStats::OpcodeMissFreq.begin();
+         it != CallSiteParamsStats::OpcodeMissFreq.end(); it++) {
+      unsigned Opc = it->getFirst();
+      unsigned Num = it->getSecond().first;
+      unsigned HNum = it->getSecond().second;
+      dbgs() << Opc << "\t\t" << Num << "\t\t" << HNum << "\t\t"
+             << CallSiteParamsStats::OpcodeToInstrMap[Opc] << "\n";
+      // to file
+      DescCSParamLogFile << Opc << " " << Num << " " << HNum << " ";
+      InstrNamesFile << Opc << " " << CallSiteParamsStats::OpcodeToInstrMap[Opc]
+                     << "\n";
+    }
+    dbgs() << "================================================================"
+           << "=====================\n";
+    // Closing the files.
+    InstrNamesFile.close();
+    DescCSParamLogFile.close();
+  }
 }
 
 // Emit all Dwarf sections that should come after the content.
